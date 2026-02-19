@@ -108,6 +108,7 @@ fn migrate_legacy_runtime_layout(data_root: &Path, runtime_dir: &Path) {
 async fn reembed_memories() -> anyhow::Result<()> {
     let config = Config::load()?;
     let runtime_data_dir = config.runtime_data_dir();
+    #[allow(unused_variables)]
     let db = db::Database::new(&runtime_data_dir)?;
 
     #[cfg(not(feature = "sqlite-vec"))]
@@ -155,13 +156,20 @@ async fn reembed_memories() -> anyhow::Result<()> {
                 }
             }
             if (i + 1) % 20 == 0 {
-                println!("  Progress: {}/{} (ok={}, fail={})", i + 1, memories.len(), success, failed);
+                println!(
+                    "  Progress: {}/{} (ok={}, fail={})",
+                    i + 1,
+                    memories.len(),
+                    success,
+                    failed
+                );
             }
         }
 
         println!("Done! {} embedded, {} failed", success, failed);
     }
 
+    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -237,6 +245,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let db = db::Database::new(&runtime_data_dir)?;
+    #[allow(unused_variables)]
+    let _db = &db;
     info!("Database initialized");
 
     let memory_manager = memory::MemoryManager::new(&runtime_data_dir);

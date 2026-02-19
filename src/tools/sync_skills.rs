@@ -17,35 +17,47 @@ impl SyncSkillsTool {
         }
     }
 
+    fn build_client() -> Result<reqwest::Client, String> {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Build the list of base URL prefixes to try for a skill directory.
+    fn skill_base_urls(source_repo: &str, skill_name: &str, git_ref: &str) -> Vec<String> {
+        vec![
+            format!(
+                "https://raw.githubusercontent.com/{}/{}/skills/{}",
+                source_repo, git_ref, skill_name
+            ),
+            format!(
+                "https://raw.githubusercontent.com/{}/{}/{}",
+                source_repo, git_ref, skill_name
+            ),
+        ]
+    }
+
     async fn fetch_skill_content(
+        client: &reqwest::Client,
         source_repo: &str,
         skill_name: &str,
         git_ref: &str,
-    ) -> Result<String, String> {
-        let candidates = [
-            format!(
-                "https://raw.githubusercontent.com/{}/{}/skills/{}/SKILL.md",
-                source_repo, git_ref, skill_name
-            ),
-            format!(
-                "https://raw.githubusercontent.com/{}/{}/{}/SKILL.md",
-                source_repo, git_ref, skill_name
-            ),
-            format!(
-                "https://raw.githubusercontent.com/{}/{}/{}.md",
-                source_repo, git_ref, skill_name
-            ),
-        ];
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .map_err(|e| e.to_string())?;
+    ) -> Result<(String, String), String> {
+        let base_urls = Self::skill_base_urls(source_repo, skill_name, git_ref);
+        let mut candidates: Vec<String> = base_urls
+            .iter()
+            .map(|b| format!("{}/SKILL.md", b))
+            .collect();
+        candidates.push(format!(
+            "https://raw.githubusercontent.com/{}/{}/{}.md",
+            source_repo, git_ref, skill_name
+        ));
 
         let mut errors = Vec::new();
-        for url in candidates {
+        for (i, url) in candidates.iter().enumerate() {
             match client
-                .get(&url)
+                .get(url)
                 .header("User-Agent", "MicroClaw/1.0")
                 .send()
                 .await
@@ -53,7 +65,13 @@ impl SyncSkillsTool {
                 Ok(resp) if resp.status().is_success() => {
                     let text = resp.text().await.map_err(|e| e.to_string())?;
                     if !text.trim().is_empty() {
-                        return Ok(text);
+                        // Return the base URL that worked (for reference file fetching)
+                        let working_base = if i < base_urls.len() {
+                            base_urls[i].clone()
+                        } else {
+                            base_urls[0].clone()
+                        };
+                        return Ok((text, working_base));
                     }
                 }
                 Ok(resp) => errors.push(format!("{} -> HTTP {}", url, resp.status())),
@@ -65,6 +83,41 @@ impl SyncSkillsTool {
             "Failed to fetch skill '{skill_name}' from {source_repo}@{git_ref}. Tried URLs:\n{}",
             errors.join("\n")
         ))
+    }
+
+    /// Known reference files that skills may include alongside SKILL.md.
+    const REFERENCE_FILES: &'static [&'static str] = &[
+        "references/patterns.md",
+        "references/sharp_edges.md",
+        "references/validations.md",
+    ];
+
+    /// Fetch all reference files that exist for a skill. Returns (relative_path, content) pairs.
+    /// Silently skips files that return 404 or errors.
+    async fn fetch_reference_files(
+        client: &reqwest::Client,
+        base_url: &str,
+    ) -> Vec<(String, String)> {
+        let mut results = Vec::new();
+        for rel_path in Self::REFERENCE_FILES {
+            let url = format!("{}/{}", base_url, rel_path);
+            match client
+                .get(&url)
+                .header("User-Agent", "MicroClaw/1.0")
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(text) = resp.text().await {
+                        if !text.trim().is_empty() {
+                            results.push((rel_path.to_string(), text));
+                        }
+                    }
+                }
+                _ => {} // silently skip missing reference files
+            }
+        }
+        results
     }
 
     fn split_frontmatter(content: &str) -> (Option<serde_yaml::Value>, String) {
@@ -297,30 +350,27 @@ impl Tool for SyncSkillsTool {
             .filter(|v| !v.trim().is_empty());
 
         // Auto-detect repo from skill_name if no explicit source_repo was given
-        let (source_repo, skill_name, git_ref) =
-            if explicit_repo.is_none() {
-                if let Some((repo, skill, ref_override)) =
-                    Self::parse_skill_reference(raw_skill_name)
-                {
-                    let git_ref = explicit_ref
-                        .map(|s| s.to_string())
-                        .or(ref_override)
-                        .unwrap_or_else(|| "main".to_string());
-                    (repo, skill, git_ref)
-                } else {
-                    (
-                        "vercel-labs/skills".to_string(),
-                        raw_skill_name.to_string(),
-                        explicit_ref.unwrap_or("main").to_string(),
-                    )
-                }
-            } else {
-                (
-                    explicit_repo.unwrap().trim().to_string(),
-                    raw_skill_name.to_string(),
-                    explicit_ref.unwrap_or("main").to_string(),
-                )
-            };
+        let (source_repo, skill_name, git_ref) = if let Some(repo) = explicit_repo {
+            (
+                repo.trim().to_string(),
+                raw_skill_name.to_string(),
+                explicit_ref.unwrap_or("main").to_string(),
+            )
+        } else if let Some((repo, skill, ref_override)) =
+            Self::parse_skill_reference(raw_skill_name)
+        {
+            let git_ref = explicit_ref
+                .map(|s| s.to_string())
+                .or(ref_override)
+                .unwrap_or_else(|| "main".to_string());
+            (repo, skill, git_ref)
+        } else {
+            (
+                "vercel-labs/skills".to_string(),
+                raw_skill_name.to_string(),
+                explicit_ref.unwrap_or("main").to_string(),
+            )
+        };
 
         let target_name = input
             .get("target_name")
@@ -336,10 +386,16 @@ impl Tool for SyncSkillsTool {
                     .to_string()
             });
 
-        let raw = match Self::fetch_skill_content(&source_repo, &skill_name, &git_ref).await {
-            Ok(v) => v,
-            Err(e) => return ToolResult::error(e).with_error_type("sync_fetch_failed"),
+        let client = match Self::build_client() {
+            Ok(c) => c,
+            Err(e) => return ToolResult::error(format!("HTTP client error: {e}")),
         };
+
+        let (raw, working_base) =
+            match Self::fetch_skill_content(&client, &source_repo, &skill_name, &git_ref).await {
+                Ok(v) => v,
+                Err(e) => return ToolResult::error(e).with_error_type("sync_fetch_failed"),
+            };
 
         let normalized =
             Self::normalize_skill_markdown(&raw, &source_repo, &git_ref, &skill_name, &target_name);
@@ -356,13 +412,33 @@ impl Tool for SyncSkillsTool {
                 .with_error_type("sync_write_failed");
         }
 
+        // Fetch and save reference files (patterns.md, sharp_edges.md, validations.md)
+        let ref_files = Self::fetch_reference_files(&client, &working_base).await;
+        let mut ref_count = 0usize;
+        for (rel_path, content) in &ref_files {
+            let ref_file = out_dir.join(rel_path);
+            if let Some(parent) = ref_file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(&ref_file, content).is_ok() {
+                ref_count += 1;
+            }
+        }
+
+        let ref_msg = if ref_count > 0 {
+            format!("\nReference files: {} synced", ref_count)
+        } else {
+            String::new()
+        };
+
         ToolResult::success(format!(
-            "Skill synced: {} -> {}\nSource: {}@{}\nPath: {}",
+            "Skill synced: {} -> {}\nSource: {}@{}\nPath: {}{}",
             skill_name,
             target_name,
             source_repo,
             git_ref,
-            out_file.display()
+            out_file.display(),
+            ref_msg,
         ))
     }
 }
@@ -402,9 +478,8 @@ mod tests {
 
     #[test]
     fn test_parse_skill_reference_owner_repo_skill() {
-        let result = SyncSkillsTool::parse_skill_reference(
-            "omer-metin/skills-for-antigravity/viral-hooks",
-        );
+        let result =
+            SyncSkillsTool::parse_skill_reference("omer-metin/skills-for-antigravity/viral-hooks");
         let (repo, skill, git_ref) = result.unwrap();
         assert_eq!(repo, "omer-metin/skills-for-antigravity");
         assert_eq!(skill, "viral-hooks");

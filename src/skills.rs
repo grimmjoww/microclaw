@@ -66,7 +66,10 @@ impl SkillManager {
         let mut skills = Vec::new();
         let entries = match std::fs::read_dir(&self.skills_dir) {
             Ok(e) => e,
-            Err(_) => return skills,
+            Err(e) => {
+                tracing::warn!("Could not read skills dir {:?}: {}", self.skills_dir, e);
+                return skills;
+            }
         };
 
         for entry in entries.flatten() {
@@ -74,15 +77,33 @@ impl SkillManager {
             if !path.is_dir() {
                 continue;
             }
+            let dir_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             let skill_md = path.join("SKILL.md");
             if !skill_md.exists() {
+                tracing::debug!("Skill dir '{}' has no SKILL.md, skipping", dir_name);
                 continue;
             }
-            if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                if let Some((meta, _body)) = parse_skill_md(&content, &path) {
-                    if include_unavailable || self.skill_is_available(&meta).is_ok() {
-                        skills.push(meta);
+            match std::fs::read_to_string(&skill_md) {
+                Ok(content) => match parse_skill_md(&content, &path) {
+                    Some((meta, _body)) => {
+                        if include_unavailable || self.skill_is_available(&meta).is_ok() {
+                            skills.push(meta);
+                        } else {
+                            tracing::debug!("Skill '{}' not available on this platform", dir_name);
+                        }
                     }
+                    None => {
+                        tracing::warn!(
+                            "Skill '{}' SKILL.md failed to parse (frontmatter/YAML issue)",
+                            dir_name
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Could not read SKILL.md for '{}': {}", dir_name, e);
                 }
             }
         }
